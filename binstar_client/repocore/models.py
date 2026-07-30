@@ -16,19 +16,19 @@ class Namespace(BaseModel):
 
 
 class Channel(BaseModel):
-    """Channel within a parent namespace channel."""
+    """A repocore channel, as returned by any of the channel endpoints.
 
-    name: str
-    privacy: str
-    description: str = ""
-    artifact_count: int = 0
-    download_count: int = 0
+    The repo API serializes channels with a single shape (``resources.channels``
+    ``dump()``); the various endpoints — the flat ``GET /channels`` listing, a
+    parent's ``/subchannels``, and a single ``GET /channels/{name}`` — differ only
+    in which of those fields they populate. This model carries the superset with
+    permissive defaults, so one class parses every channel response.
 
-    _handle_description = field_validator("description", mode="before")(_handle_none_as_empty_string)
-
-
-class NamespaceChannel(BaseModel):
-    """Parent namespace channel data from the repo API."""
+    A repocore "namespace" is a top-level channel named after the org; a user's
+    actual channel is a subchannel beneath it. So a channel's namespace is its
+    ``parent`` (when present); ``name`` alone is the bare channel name. ``path``
+    reconstructs the ``namespace/channel`` form used for display.
+    """
 
     name: str
     privacy: str
@@ -40,6 +40,7 @@ class NamespaceChannel(BaseModel):
     indexing_behavior: str = "default"
     created: str = ""
     updated: str = ""
+    parent: Optional[str] = None
     owners: list[str] = Field(default_factory=list)
 
     _handle_description = field_validator("description", mode="before")(_handle_none_as_empty_string)
@@ -50,6 +51,16 @@ class NamespaceChannel(BaseModel):
         if v is None:
             return []
         return [o for o in v if o]
+
+    @property
+    def namespace(self) -> Optional[str]:
+        """The channel's namespace: its parent top-level channel, if any."""
+        return self.parent
+
+    @property
+    def path(self) -> str:
+        """The ``namespace/channel`` display path (or bare name for a top-level channel)."""
+        return f"{self.parent}/{self.name}" if self.parent else self.name
 
 
 class ChannelCreationResponse(BaseModel):
