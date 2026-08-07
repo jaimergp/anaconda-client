@@ -8,6 +8,11 @@ from binstar_client.repocore.models import (
     Namespace,
     ResolvedChannel,
 )
+from binstar_client.repocore.telemetry import (
+    ChannelEvents,
+    UpgradeEvents,
+    UploadEvents,
+)
 
 __all__ = [
     "REPO_API_PATH",
@@ -18,4 +23,7 @@ __all__ = [
     "ChannelUpdateResponse",
     "Namespace",
     "ResolvedChannel",
+    "ChannelEvents",
+    "UpgradeEvents",
+    "UploadEvents",
 ]
