@@ -13,6 +13,7 @@ from binstar_client.repocore.errors import InvalidName, RepoCoreError, Unauthori
 from binstar_client.repocore.models import (
     Channel,
     ChannelCreationResponse,
+    ChannelUpdateResponse,
     Namespace,
 )
 from binstar_client.repocore.package_utils import PackageType
@@ -164,12 +165,13 @@ class RepoCoreClient(BaseClient):
         data = self._manage_response(response, f"getting channel {channel}")
         return Channel(**data)
 
-    def update_channel(self, channel: str, **data):
+    def update_channel(self, channel: str, **data) -> "ChannelUpdateResponse":
+        """Update a channel; ``changed`` reflects the endpoint's ``{"changed": bool}``
+        body (``false`` when the channel already held every submitted value)."""
         url = self._get_channel_url(channel)
         response = self.put(url, json=data)
-        return self._manage_response(
-            response, f"updating channel {channel}", success_codes=[200, 204], empty_success_codes=[200, 204]
-        )
+        body = self._manage_response(response, f"updating channel {channel}", success_codes=[200])
+        return ChannelUpdateResponse(changed=bool((body or {}).get("changed", False)))
 
     def list_all_channels(
         self, offset: int = 0, limit: int = 100, include_subchannels: bool = True
