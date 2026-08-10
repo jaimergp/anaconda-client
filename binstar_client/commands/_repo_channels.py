@@ -13,22 +13,26 @@ from glob import glob
 from typing import List, Optional, Tuple, cast
 
 import typer
+from pydantic import BaseModel
 from rich.panel import Panel
 
 from anaconda_cli_base.console import Table, console, select_from_list
 from binstar_client import __version__
 from binstar_client.commands import _channel_notices as channel_notices
+from binstar_client.commands import remove as remove_mod
+from binstar_client.commands import show as show_mod
 from binstar_client.commands import upload as upload_mod
 from binstar_client.repocore import RepoCoreClient
 from binstar_client.repocore.errors import RepoCoreError, Unauthorized
 from binstar_client.repocore.telemetry import ChannelEvents, UploadEvents
 from binstar_client.repocore.package_utils import PackageType, determine_package_type, windows_glob
 from binstar_client.repocore.resolve import (
+    classify_and_resolve,
     resolve_channels_with_namespaces as _resolve_channels_with_namespaces,
     resolve_namespace_and_channel as _resolve_namespace_and_channel,
     resolve_no_namespace as _resolve_no_namespace,
 )
-from binstar_client.utils import get_server_api
+from binstar_client.utils import get_server_api, parse_specs
 from binstar_client.utils.console_utils import configure_console_encoding
 
 __all__ = ["app", "_resolve_namespace_and_channel", "_resolve_no_namespace", "_resolve_channels_with_namespaces"]
@@ -52,6 +56,35 @@ app = typer.Typer(
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+
+
+class _DotOrgCredentials(BaseModel):
+    """The ``--token``/``--site`` pair plus the anaconda.org owner probe built from them.
+
+    Shared by the ``show``, ``upload``, and ``remove-package`` commands to route a
+    bare name to anaconda.org (dotorg) when it matches an owner there.
+
+    ``--at`` selects the anaconda.com (repo) domain and is NOT a valid anaconda.org
+    site alias, so only ``--site`` is carried here as ``site``.
+    """
+
+    token: Optional[str] = None
+    site: Optional[str] = None
+
+    @classmethod
+    def from_ctx(cls, ctx) -> "_DotOrgCredentials":
+        """Read ``--token``/``--site`` off the command context's params."""
+        params = getattr(ctx.obj, "params", {})
+        return cls(token=params.get("token"), site=params.get("site"))
+
+    def owner_probe(self, name: str) -> bool:
+        """Whether ``name`` is a real anaconda.org owner (user or organization)."""
+        try:
+            aserver_api = get_server_api(self.token, self.site)
+            aserver_api.user(name)
+            return True
+        except Exception:
+            return False
 
 
 def _extract_limit_from_error(error: Exception) -> Optional[int]:
@@ -434,11 +467,44 @@ def show_command(
     name: str = typer.Argument(..., help="Channel name to show"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Namespace the channel belongs to"),
     full_details: bool = typer.Option(False, "--full-details", help="Show full details including subchannels"),
+    packages: bool = typer.Option(False, "--packages", "-p", help="Also list the packages in the channel."),
+    files: bool = typer.Option(
+        False,
+        "--files",
+        help="Also list individual files (with the exact filename to remove) instead of a package summary.",
+    ),
 ) -> None:
-    """Show information about a channel."""
+    """Show information about a channel.
+
+    Like ``channel upload``, this proxies across systems: a bare ``name`` that
+    matches an anaconda.org owner routes to anaconda.org (delegating to the
+    legacy ``anaconda show``); otherwise it targets an anaconda.com (repocore)
+    channel.
+
+    By default this prints channel metadata only. ``--packages/-p`` appends a
+    package summary; ``--files`` appends a per-file listing (with the exact
+    filename to pass to ``remove-package``). The two listing flags are alternatives.
+    """
+    # --packages/-p and --files pick the listing format; reject both at once
+    # rather than silently letting one win.
+    if packages and files:
+        console.print("[red]Error:[/red] --packages/-p and --files are mutually exclusive; specify at most one.")
+        raise typer.Exit(1)
+
     api = ctx.obj.repo_api
-    resolved = _resolve_namespace_and_channel(api, name, namespace)
-    name = f"{resolved.namespace}/{resolved.channel_name}"
+    dotorg_creds = _DotOrgCredentials.from_ctx(ctx)
+
+    # Classify the name the same way `channel upload`/`remove-package` do: a bare
+    # name matching an anaconda.org owner routes to dotorg, otherwise anaconda.com.
+    resolved = classify_and_resolve(api, name, namespace, owner_probe=dotorg_creds.owner_probe)
+
+    if resolved.target == "org":
+        # anaconda.org packages/files listings don't apply; `anaconda show OWNER`
+        # already lists the owner's packages.
+        _show_dotorg(cast(str, resolved.owner), dotorg_creds.token, dotorg_creds.site)
+        return
+
+    name = f"{resolved.namespace}/{resolved.channel_name}" if resolved.namespace else resolved.channel_name
     channel_data, error = api.get_namespace_channel(name)
     ChannelEvents.accessed(api, app.info.name, channel_path=name, action="show", error=bool(error))
     if error:
@@ -487,6 +553,10 @@ def show_command(
                 str(sub.artifact_count),
             )
         console.print(sub_table)
+
+    if packages or files:
+        console.print()
+        _render_package_listing(api, name, files)
 
 
 @app.command(name="modify", help="Modify channel settings")
@@ -565,8 +635,7 @@ def _do_upload(
     namespace: Optional[str],
     package_type: Optional[str],
     from_deprecated_channel_flag: bool,
-    token_value: Optional[str],
-    org_site_value: Optional[str] = None,
+    dotorg_creds: _DotOrgCredentials,
     labels: Optional[List[str]] = None,
     org_upload_args: object = None,
 ) -> None:
@@ -585,19 +654,8 @@ def _do_upload(
         console.print("[red]Error:[/red] No channel specified. Use --channel option to specify target channel(s).")
         raise typer.Exit(1)
 
-    # Probe used to detect anaconda.org owners so a bare name can route to dotorg.
-    # Note: ``--at`` selects the anaconda.com (repo) domain and is NOT a valid
-    # anaconda.org site alias, so it must not be forwarded here.
-    def _owner_probe(name: str) -> bool:
-        try:
-            aserver_api = get_server_api(token_value, org_site_value)
-            aserver_api.user(name)
-            return True
-        except Exception:
-            return False
-
     resolved = _resolve_channels_with_namespaces(
-        api, channels, namespace, from_deprecated_channel_flag, owner_probe=_owner_probe
+        api, channels, namespace, from_deprecated_channel_flag, owner_probe=dotorg_creds.owner_probe
     )
 
     org_targets = [r for r in resolved if r.target == "org"]
@@ -638,16 +696,13 @@ def upload_command(
     org_upload_args: object = None,
 ) -> None:
     """Programmatic entry for uploads (used by the ``anaconda upload`` bridge)."""
-    token_value = None
-    org_site_value = None
     if ctx is None:
         from anaconda_cli_base.cli import ContextExtras
         from binstar_client import __version__
 
         # Carry --site/--token from the `anaconda upload` bridge, if provided.
-        token_value = getattr(org_upload_args, "token", None)
         site_value = getattr(org_upload_args, "site", None)
-        org_site_value = site_value  # `anaconda upload --site` is an anaconda.org alias
+        dotorg_creds = _DotOrgCredentials(token=getattr(org_upload_args, "token", None), site=site_value)
 
         ctx_obj = ContextExtras()
         ctx_obj.repo_api = RepoCoreClient(site=site_value, version=__version__)
@@ -657,10 +712,7 @@ def upload_command(
 
         ctx = FakeContext()
     else:
-        params = getattr(ctx.obj, "params", {})
-        token_value = params.get("token")
-        # --at selects the anaconda.com domain; only --site is an anaconda.org alias.
-        org_site_value = params.get("site")
+        dotorg_creds = _DotOrgCredentials.from_ctx(ctx)
 
     _do_upload(
         ctx.obj.repo_api,
@@ -669,8 +721,7 @@ def upload_command(
         namespace,
         package_type,
         from_deprecated_channel_flag,
-        token_value,
-        org_site_value=org_site_value,
+        dotorg_creds,
         labels=labels,
         org_upload_args=org_upload_args,
     )
@@ -709,8 +760,6 @@ def _upload_cli(
     ),
 ) -> None:
     """Upload packages to your Anaconda repository."""
-    params = getattr(ctx.obj, "params", {})
-    token_value = params.get("token")
     # typer validates -t against the repocore enum at the CLI boundary; hand the
     # raw string down so _do_upload can validate per-target uniformly.
     _do_upload(
@@ -720,8 +769,7 @@ def _upload_cli(
         namespace,
         package_type.value if package_type else None,
         from_deprecated_channel_flag=False,
-        token_value=token_value,
-        org_site_value=params.get("site"),
+        dotorg_creds=_DotOrgCredentials.from_ctx(ctx),
         labels=label or [],
     )
 
@@ -786,6 +834,246 @@ def share_command(
         if error:
             raise error
         console.print(f"[green]Success![/green] {action.capitalize()}d channel '[cyan]{ch}[/cyan]' with {user}")
+
+
+def _iter_all_artifacts(api, channel: str):
+    """Yield every package (artifact) in ``channel``, paging through the listing."""
+    offset = 0
+    while True:
+        artifacts, total = api.list_artifacts(channel, offset=offset, limit=_PAGE_SIZE)
+        yield from artifacts
+        offset += len(artifacts)
+        # Stop on an empty/short page too, so an over-reported total can't loop forever.
+        if not artifacts or len(artifacts) < _PAGE_SIZE or offset >= total:
+            break
+
+
+def _iter_artifact_files(api, channel: str, family: str, name: str):
+    """Yield every file of one package in ``channel``, paging through the listing."""
+    offset = 0
+    while True:
+        files, total = api.list_artifact_files(channel, family, name, offset=offset, limit=_PAGE_SIZE)
+        yield from files
+        offset += len(files)
+        # Stop on an empty/short page too, so an over-reported total can't loop forever.
+        if not files or len(files) < _PAGE_SIZE or offset >= total:
+            break
+
+
+def _find_file_by_name(api, channel: str, filename: str):
+    """Find the (family, name, ckey) of a package file by its bare filename.
+
+    Scans the channel's packages and their files, matching on the ckey basename.
+    Returns a list of matching ``(family, name, ckey)`` tuples so the caller can
+    report ambiguity (the same filename under more than one package/subdir).
+    """
+    matches: List[Tuple[str, str, str]] = []
+    for artifact in _iter_all_artifacts(api, channel):
+        for f in _iter_artifact_files(api, channel, artifact.family, artifact.name):
+            if f.filename == filename:
+                matches.append((artifact.family, artifact.name, f.ckey))
+    return matches
+
+
+def _fmt_size(num_bytes: int) -> str:
+    """Human-readable byte size for the files table."""
+    size = float(num_bytes or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _render_package_listing(api, channel: str, files: bool) -> None:
+    """Print the package (or, with ``files``, per-file) listing for a channel.
+
+    The package summary shows one row per package. ``files=True`` drills into
+    every file so the exact filename to pass to ``remove-package`` is visible.
+    Long listings page through the console.
+    """
+    if files:
+        table = Table(title=f"Files in {channel}")
+        table.add_column("Filename", style="cyan")
+        table.add_column("Package")
+        table.add_column("Family")
+        table.add_column("Size", justify="right")
+        row_count = 0
+        for artifact in _iter_all_artifacts(api, channel):
+            for f in _iter_artifact_files(api, channel, artifact.family, artifact.name):
+                table.add_row(f.filename, f.name or artifact.name, f.family or artifact.family, _fmt_size(f.size))
+                row_count += 1
+    else:
+        table = Table(title=f"Packages in {channel}")
+        table.add_column("Package", style="cyan")
+        table.add_column("Family")
+        table.add_column("Versions", justify="right")
+        table.add_column("Files", justify="right")
+        table.add_column("Downloads", justify="right")
+        row_count = 0
+        for artifact in _iter_all_artifacts(api, channel):
+            table.add_row(
+                artifact.name,
+                artifact.family,
+                str(len(artifact.available_versions)),
+                str(artifact.file_count),
+                str(artifact.download_count),
+            )
+            row_count += 1
+
+    if row_count == 0:
+        console.print(f"No packages found in [cyan]{channel}[/cyan].")
+        return
+
+    if console.height and table.row_count > console.height:
+        with console.pager():
+            console.print(f"[dim]Showing {table.row_count} rows — ↑/↓ to scroll, press q to quit.[/dim]")
+            console.print(table)
+    else:
+        console.print(table)
+
+
+def _remove_from_repo(api, channel: str, target: str, force: bool) -> None:
+    """Remove a single file (by filename) from an anaconda.com repo channel.
+
+    ``target`` is the bare filename; it is resolved to its file (ckey) by
+    scanning the channel, then removed via the bulk endpoint so only that one
+    file goes, not the whole package.
+    """
+    matches = _find_file_by_name(api, channel, target)
+    if not matches:
+        console.print(
+            f"[red]Error:[/red] No file named '[cyan]{target}[/cyan]' found in channel '[cyan]{channel}[/cyan]'. "
+            f"Run 'anaconda channel view -c {channel} --files' to list removable filenames."
+        )
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        console.print(f"[red]Error:[/red] '{target}' matches more than one file in '{channel}':")
+        for family, name, ckey in matches:
+            console.print(f"  - {family}/{name}: [cyan]{ckey}[/cyan]")
+        console.print("This is unexpected for a single filename; contact support if it persists.")
+        raise typer.Exit(1)
+
+    family, name, ckey = matches[0]
+
+    if not force:
+        console.print(f"About to remove [cyan]{ckey}[/cyan] ({family}/{name}) from [cyan]{channel}[/cyan].")
+        if not typer.confirm("Are you sure?"):
+            raise typer.Exit(0)
+
+    api.delete_artifact_file(channel, family, name, ckey)
+    console.print(f"[green]Success![/green] Removed [cyan]{target}[/cyan] from '[cyan]{channel}[/cyan]'.")
+
+
+def _ensure_binstar_console_logging() -> None:
+    """Make the legacy ``binstar`` logger print to the console at INFO.
+
+    The delegated legacy commands (``show``/``remove``) write their user-facing
+    output via ``logging`` at INFO. Under the standalone ``binstar`` entrypoint
+    that logger is configured by ``setup_logging``; but when we call their
+    ``main()`` from inside the ``anaconda channel`` Typer app nothing has
+    configured it, so INFO records are dropped (the logger defaults to WARNING
+    with no handler) and the command appears to print nothing. Install a plain
+    console handler at INFO once, only if none is already attached.
+    """
+    binstar_logger = logging.getLogger("binstar")
+    if binstar_logger.level == logging.NOTSET or binstar_logger.level > logging.INFO:
+        binstar_logger.setLevel(logging.INFO)
+    if not any(isinstance(h, logging.StreamHandler) for h in binstar_logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        binstar_logger.addHandler(handler)
+
+
+def _show_dotorg(owner: str, token_value, org_site_value) -> None:
+    """Delegate a channel show for an anaconda.org owner to the legacy ``show`` path.
+
+    anaconda.org has no repocore channel metadata; ``anaconda show OWNER`` lists
+    the owner's packages, which is the closest equivalent — the same proxying
+    ``channel upload`` does for owner-only names.
+    """
+    # show.main emits its listing through the binstar logger at INFO; ensure it
+    # reaches the console when invoked via this Typer app (see helper).
+    _ensure_binstar_console_logging()
+    args = argparse.Namespace(
+        token=token_value,
+        site=org_site_value,
+        spec=parse_specs(owner),
+    )
+    show_mod.main(args)
+
+
+def _remove_from_dotorg(owner: str, target: str, token_value, org_site_value, force: bool) -> None:
+    """Delegate a package removal to the anaconda.org ``remove`` path.
+
+    anaconda.org has no bare-filename delete; its grammar is
+    ``owner/package/version/filename``. The ``target`` is the part after the
+    owner (``-c owner`` supplies the owner), so we reconstruct the full spec and
+    hand it to the legacy remove command — the same proxying ``channel upload``
+    does for owner-only names.
+    """
+    spec = target if target.startswith(f"{owner}/") else f"{owner}/{target}"
+    args = argparse.Namespace(
+        token=token_value,
+        site=org_site_value,
+        specs=[parse_specs(spec)],
+        force=force,
+    )
+    remove_mod.main(args)
+
+
+@app.command(name="remove-package", help="Remove a package file from a channel")
+def remove_package_command(
+    ctx: typer.Context,
+    target: str = typer.Argument(
+        ...,
+        metavar="PACKAGE",
+        help=(
+            "For an anaconda.com channel: the package filename to remove "
+            "(e.g. numpy-2.2.5-py313h51bfb38_3.conda). For an anaconda.org owner: "
+            "the package spec 'package/version/filename'."
+        ),
+    ),
+    channel: Optional[List[str]] = typer.Option(
+        None,
+        "--channel",
+        "-c",
+        help="Channel 'namespace/channel'/'channel', or an anaconda.org owner.",
+    ),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Namespace the channel belongs to"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip the confirmation prompt."),
+) -> None:
+    """Remove a single package file from a channel.
+
+    Like ``channel upload``, this proxies across systems: a ``-c`` value that names
+    an anaconda.org owner routes to anaconda.org; otherwise it targets an
+    anaconda.com (repocore) channel. On anaconda.com a package spans many files, so
+    removal targets one file — the filename is resolved to its file (ckey) by
+    scanning the channel; run ``anaconda channel view -c CHANNEL --files`` to see
+    removable filenames.
+    """
+    channels = channel or []
+    if not channels:
+        console.print("[red]Error:[/red] No channel specified. Use --channel/-c to specify a channel.")
+        raise typer.Exit(1)
+    if len(channels) > 1:
+        console.print("[red]Error:[/red] remove-package accepts a single channel; specify -c once.")
+        raise typer.Exit(1)
+
+    api = ctx.obj.repo_api
+    dotorg_creds = _DotOrgCredentials.from_ctx(ctx)
+
+    # Classify the -c target the same way `channel upload` does: a bare name that
+    # matches an anaconda.org owner routes to dotorg, otherwise anaconda.com.
+    resolved = classify_and_resolve(api, channels[0], namespace, owner_probe=dotorg_creds.owner_probe)
+
+    if resolved.target == "org":
+        _remove_from_dotorg(cast(str, resolved.owner), target, dotorg_creds.token, dotorg_creds.site, force)
+        return
+
+    channel_path = f"{resolved.namespace}/{resolved.channel_name}" if resolved.namespace else resolved.channel_name
+    _remove_from_repo(api, channel_path, target, force)
 
 
 channel_notices.mount_notice_subcommand(app)
