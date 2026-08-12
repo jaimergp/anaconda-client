@@ -102,6 +102,14 @@ def _extract_limit_from_error(error: Exception) -> Optional[int]:
     return int(limit_match.group(1)) if limit_match else None
 
 
+def _print_modify_result(result, channel_name: str, description: str) -> None:
+    """Print success or no-change message based on update result."""
+    if result.changed:
+        console.print(f"[green]Success![/green] Channel '[cyan]{channel_name}[/cyan]' is now {description}.")
+    else:
+        console.print(f"[yellow]No change:[/yellow] Channel '[cyan]{channel_name}[/cyan]' is already {description}.")
+
+
 @app.callback(invoke_without_command=True)
 def _callback(
     ctx: typer.Context,
@@ -643,8 +651,12 @@ def modify_command(
     resolved = _resolve_namespace_and_channel(api, name, namespace)
     name = f"{resolved.namespace}/{resolved.channel_name}"
 
-    # The PUT reports whether it actually changed anything, so a no-op is surfaced
-    # rather than a misleading "Success!".
+    telemetry_kwargs = {"channel_path": name}
+    if privacy:
+        telemetry_kwargs["privacy"] = privacy
+    if indexing_behavior:
+        telemetry_kwargs["indexing_behavior"] = indexing_behavior
+
     if privacy:
         result, error = api.update_channel(name, privacy=privacy)
         if error:
@@ -652,34 +664,22 @@ def modify_command(
             if "limit" in error_msg and "private" in error_msg:
                 limit_value = _extract_limit_from_error(error)
                 ChannelEvents.limit(api, app.info.name, channel_path=name, action="modify", limit=limit_value)
-        ChannelEvents.modified(api, app.info.name, channel_path=name, privacy=privacy, error=bool(error))
-        if error:
+            ChannelEvents.modified(api, app.info.name, error=True, **telemetry_kwargs)
             raise error
-        if result.changed:
-            state_map = {"private": "locked", "authenticated": "soft-locked", "public": "unlocked"}
-            console.print(
-                f"[green]Success![/green] Channel '[cyan]{name}[/cyan]' is now {state_map[privacy]} ({privacy})."
-            )
-        else:
-            console.print(f"[yellow]No change:[/yellow] Channel '[cyan]{name}[/cyan]' is already {privacy}.")
+        telemetry_kwargs["privacy_changed"] = result.changed
+        state_map = {"private": "locked", "authenticated": "soft-locked", "public": "unlocked"}
+        _print_modify_result(result, name, f"{state_map[privacy]} ({privacy})")
 
     if indexing_behavior:
         result, error = api.update_channel(name, indexing_behavior=indexing_behavior)
-        ChannelEvents.modified(
-            api, app.info.name, channel_path=name, indexing_behavior=indexing_behavior, error=bool(error)
-        )
         if error:
+            ChannelEvents.modified(api, app.info.name, error=True, **telemetry_kwargs)
             raise error
-        if result.changed:
-            state_map = {"frozen": "frozen", "default": "unfrozen"}
-            console.print(
-                f"[green]Success![/green] Channel '[cyan]{name}[/cyan]' is now {state_map[indexing_behavior]}."
-            )
-        else:
-            console.print(
-                f"[yellow]No change:[/yellow] Channel '[cyan]{name}[/cyan]' indexing behavior is already "
-                f"{indexing_behavior}."
-            )
+        telemetry_kwargs["indexing_behavior_changed"] = result.changed
+        state_map = {"frozen": "frozen", "default": "unfrozen"}
+        _print_modify_result(result, name, state_map[indexing_behavior])
+
+    ChannelEvents.modified(api, app.info.name, error=False, **telemetry_kwargs)
 
 
 def _do_upload(
