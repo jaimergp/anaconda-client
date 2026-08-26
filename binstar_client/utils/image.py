@@ -14,17 +14,18 @@ from ..errors import PillowNotInstalled
 THUMB_SIZE = (340, 210)
 
 
-def resize_and_convert(path: str | Path) -> io.BytesIO:
+def resize_and_convert(path_or_buffer: str | Path | io.RawIOBase) -> io.BytesIO:
     """
     Fits an image into a bounding box while preserving ratio.
     If Pillow is not available, uses pypng for a simpler fallback.
     """
-    path = Path(path)
     if Image is None:
-        if path.suffix.lower() == ".png":
-            return _resize_and_convert_pypng(path)
+        # For known .png paths, we can fallback to pypng
+        if isinstance(path_or_buffer, (str, Path)):
+            if str(path_or_buffer).lower().endswith(".png"):
+                return _resize_and_convert_pypng(path_or_buffer)
         raise PillowNotInstalled()
-    image = Image.open(path)
+    image = Image.open(path_or_buffer)
     image.thumbnail(THUMB_SIZE)
     out = io.BytesIO()
     image.save(out, format='png')
