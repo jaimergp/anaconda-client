@@ -1,5 +1,10 @@
 import io
-from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from os import PathLike
+    from pathlib import Path
+    from typing import IO
 
 import png
 
@@ -14,7 +19,7 @@ from ..errors import PillowNotInstalled
 THUMB_SIZE = (340, 210)
 
 
-def resize_and_convert(path_or_buffer: str | Path | io.RawIOBase) -> io.BytesIO:
+def resize_and_convert(path_or_buffer: str | bytes | PathLike[str] | PathLike[bytes] | IO[bytes]) -> io.BytesIO:
     """
     Fits an image into a bounding box while preserving ratio.
     If Pillow is not available, uses pypng for a simpler fallback.
